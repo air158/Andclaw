@@ -74,8 +74,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
     var isAgentRunning = false
         private set
     private var agentJob: Job? = null
-    private var consecutiveSameCount = 0
-    private var lastFingerprint = ""
+    private val recentFingerprints = ArrayDeque<String>()
     private var loopRetryCount = 0
     private var uiState = AgentUiState()
 
@@ -341,8 +340,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         addMessage("user", input)
         isAgentRunning = true
         uiState = uiState.copy(isRunning = true, userInput = input)
-        consecutiveSameCount = 0
-        lastFingerprint = ""
+        recentFingerprints.clear()
         loopRetryCount = 0
 
         Log.d(TAG, "startAgent: provider=${config.provider}, model=${config.model}, apiUrl=${config.apiUrl}, apiKey=${Utils.maskKey(config.apiKey)}")
@@ -374,7 +372,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         }
 
         val currentMessages = _messages.value
-        val historyContext = currentMessages.takeLast(12).mapNotNull {
+        val historyContext = currentMessages.takeLast(20).mapNotNull {
             when (it.role) {
                 "user" -> mapOf("role" to "user", "content" to it.content)
                 "ai" -> it.action?.let { action ->
@@ -387,7 +385,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
                         content.startsWith("Execution Exception:") ||
                         content.startsWith("Error occurred:") ||
                         content.startsWith("AI Request Failed:") ||
-                        (content.startsWith("Action success.") && content.contains("\n"))
+                        content.startsWith("Action success.")
                     if (shouldKeep) {
                         mapOf("role" to "user", "content" to "System feedback: $content")
                     } else {
@@ -446,27 +444,23 @@ object AgentController : ITgBridgeService, IAiConfigService {
             AiAction.TYPE_HTTP_REQUEST -> "${action.type}_${action.data}_${action.httpMethod}"
             else -> "${action.type}_${action.x}_${action.y}"
         }
-        if (fingerprint == lastFingerprint) {
-            consecutiveSameCount++
-        } else {
-            consecutiveSameCount = 1
-            lastFingerprint = fingerprint
-            loopRetryCount = 0
-        }
+        recentFingerprints.addLast(fingerprint)
+        if (recentFingerprints.size > 12) recentFingerprints.removeFirst()
 
-        if (consecutiveSameCount >= 5) {
-            consecutiveSameCount = 0
+        // Catch both consecutive loops (A A A A) and alternating loops (A B A B A B A B)
+        if (recentFingerprints.count { it == fingerprint } >= 4) {
             loopRetryCount++
+            recentFingerprints.clear()
 
             if (loopRetryCount >= 3) {
-                addMessage("system", "Loop detected. Same action [$fingerprint] repeated ${loopRetryCount * 5} times with screenshots. Agent stopped.")
+                addMessage("system", "Loop detected. Action [$fingerprint] repeated too many times. Agent stopped.")
                 stopAgent()
                 return
             }
 
             scope.launch {
                 val screenshot = captureScreenBase64()
-                addMessage("system", "Loop detected. Action [$fingerprint] repeated 5 times. Taking screenshot for visual analysis... (retry $loopRetryCount/3)", screenshotBase64 = screenshot)
+                addMessage("system", "Loop detected: [$fingerprint] repeated 4+ times in last 12 steps. Taking screenshot for visual analysis. (retry $loopRetryCount/3)", screenshotBase64 = screenshot)
                 executeAgentStep(uiState.userInput, screenshotBase64 = screenshot)
             }
             return

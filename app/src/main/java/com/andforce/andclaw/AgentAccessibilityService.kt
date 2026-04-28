@@ -71,6 +71,17 @@ class AgentAccessibilityService : AccessibilityService() {
                 if (node.isClickable) sb.append(",c:1")
                 if (node.isEditable) sb.append(",e:1")
                 if (node.isFocused) sb.append(",f:1")
+                // resource-id local name helps LLM distinguish nav buttons from content items
+                val resId = node.viewIdResourceName
+                if (!resId.isNullOrEmpty()) {
+                    val local = resId.substringAfter("/", "")
+                    if (local.isNotEmpty() && !local.all { it.isDigit() }) sb.append(",id:$local")
+                }
+                // class name helps LLM distinguish ImageButton (icon) from TextView (text)
+                if (node.isClickable) {
+                    val cls = node.className?.toString()
+                    if (!cls.isNullOrEmpty()) sb.append(",cls:${cls.substringAfterLast('.')}")
+                }
                 sb.append("}\n")
             }
         }

@@ -208,7 +208,7 @@ Example: {"type":"text_input","text":"Hello World"}
 
 === GLOBAL_ACTION ===
 System-level actions. Use "global_action" field with one of:
-- "back" — Press back button
+- "back" — Press the system back button. ALWAYS use this to go back/return to the previous screen. It works in every app without needing to find a button.
 - "home" — Go to home screen
 - "recents" — Open recent apps
 - "notifications" — Pull down notification shade
@@ -281,7 +281,9 @@ $dpmSection
 2. Use "click" for on-screen UI elements.
 3. Use "swipe" for scrolling or page navigation.
 4. Use "text_input" to fill text fields directly — do NOT click the field first, the system handles focus automatically. This works in both native apps and browsers.
-5. Use "global_action" for system navigation (back, home, etc.).
+5. NAVIGATION RULES — read carefully:
+   a) To go BACK to the previous screen (返回/退出/上一步/上一页): use {"type":"global_action","global_action":"back"}. Do NOT click ← toolbar arrows or 返回 text elements for this purpose.
+   b) To go to a different TAB within an app (e.g., switch to 首页/消息/我 tab): find the clickable tab element (c:1) in the BOTTOM navigation bar (elements with y near screen height, typically y > 85% of screen height) and CLICK it. Do NOT use global_action:back to switch tabs — back navigates the stack, not the tab bar.
 6. BROWSER/WEBVIEW: When a screenshot is attached and shows a browser or web page, the UI tree text may be incomplete or inaccurate. ALWAYS trust the screenshot over the UI tree for determining page content and element positions. In browser pages, after clicking an input field, use "text_input" to type — the system handles browser input automatically.
 7. Use "download" to download files directly — do NOT open a browser just to download.
 8. Use "http_request" when the user needs to call an HTTP API, webhooks, or fetch JSON/text from a URL. Do NOT open a browser for simple API calls.
@@ -441,15 +443,17 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
 
             Log.d(TAG, "callLLMWithHistory: provider=${config.provider}, isKimi=$isKimi, model=${config.model}, apiUrl=${config.apiUrl}, apiKey=${maskKey(config.apiKey)}")
 
-            val screenHint = if (screenshotBase64 != null) {
-                val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                val metrics = DisplayMetrics()
-                @Suppress("DEPRECATION")
-                wm.defaultDisplay.getRealMetrics(metrics)
-                val sw = metrics.widthPixels
-                val sh = metrics.heightPixels
+            val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            wm.defaultDisplay.getRealMetrics(metrics)
+            val sw = metrics.widthPixels
+            val sh = metrics.heightPixels
 
-                """Current Screen UI (each element: {t:'text',xy:[cx,cy],c:1=clickable,e:1=editable/input,f:1=focused} — xy is center coords for click. If e:1,f:1 both present, the input field is already focused and keyboard is open — use text_input directly without clicking again):
+            val uiHeader = "Current Screen UI (screen ${sw}x${sh}px; elements near y>${sh*85/100} are bottom navigation bar; each element: {t:'text',xy:[cx,cy],c:1=clickable,e:1=editable/input,f:1=focused,id:resource-id,cls:ClassName})"
+
+            val screenHint = if (screenshotBase64 != null) {
+                """$uiHeader:
 $screenData
 
 IMPORTANT — SCREENSHOT ATTACHED (Screen resolution: ${sw}x${sh} pixels)
@@ -461,7 +465,7 @@ BROWSER/WEBVIEW NOTE: If the screenshot shows a browser or web page, rely on the
 Respond with JSON only."""
             }
             else
-                "Current Screen UI (each element: {t:'text',xy:[cx,cy],c:1=clickable,e:1=editable/input,f:1=focused} — xy is center coords for click. If e:1,f:1 both present, the input field is already focused and keyboard is open — use text_input directly without clicking again):\n$screenData\n\nPerform the next step. Respond with JSON only."
+                "$uiHeader:\n$screenData\n\nPerform the next step. Respond with JSON only."
 
             if (isKimi) {
                 val kimiMessages = mutableListOf<KimiMessage>()
