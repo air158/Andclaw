@@ -11,6 +11,7 @@ import android.widget.Toast
 import com.andforce.andclaw.model.AiAction
 import com.andforce.andclaw.model.ApiConfig
 import com.demo.model.KimiApiClient
+import com.demo.model.KimiApiException
 import com.demo.model.KimiMessage
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
@@ -431,6 +432,20 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
             "{\"type\": \"error\", \"reason\": \"$message\", \"progress\": \"Error\"}"
         }
 
+        // Try to extract a human-readable message from an API error response body.
+        // Handles OpenAI-compatible format: {"error":{"message":"..."}} or {"message":"..."}
+        val extractApiError = { code: Int, body: String ->
+            val detail = try {
+                val json = JSONObject(body)
+                json.optJSONObject("error")?.optString("message")
+                    ?: json.optString("message").takeIf { it.isNotEmpty() }
+                    ?: body.take(200)
+            } catch (_: Exception) {
+                body.take(200)
+            }
+            "API Error $code: $detail"
+        }
+
         try {
             val client = OkHttpClient.Builder()
                 .connectTimeout(60, TimeUnit.SECONDS)
@@ -544,7 +559,49 @@ Respond with JSON only."""
                 val responseString = response.body.string()
                 if (!response.isSuccessful) {
                     Log.e(TAG, "OpenAI API Error ${response.code}: $responseString")
-                    return@withContext errorJsonStub("API Error ${response.code}")
+                    // If request included a screenshot and got 400, retry without screenshot
+                    // (model likely doesn't support vision/multimodal input)
+                    if (response.code == 400 && screenshotBase64 != null) {
+                        Log.w(TAG, "Got 400 with screenshot, retrying without image (model may not support vision)")
+                        val textOnlyContent = "$uiHeader:\n$screenData\n\nPerform the next step. Respond with JSON only."
+                        val fallbackBody = JSONObject().apply {
+                            put("model", config.model)
+                            put("messages", JSONArray().apply {
+                                put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
+                                history.forEach { msg ->
+                                    put(JSONObject().apply {
+                                        put("role", if (msg["role"] == "ai") "assistant" else msg["role"])
+                                        put("content", msg["content"])
+                                    })
+                                }
+                                put(JSONObject().apply {
+                                    put("role", "user")
+                                    put("content", textOnlyContent)
+                                })
+                            })
+                            if (!config.model.contains("k2.5")) put("temperature", 0.0)
+                            put("response_format", JSONObject().put("type", "json_object"))
+                        }.toString()
+                        val fallbackRequest = Request.Builder()
+                            .url(url)
+                            .post(fallbackBody.toRequestBody("application/json".toMediaType()))
+                            .header("Authorization", "Bearer ${config.apiKey}")
+                            .build()
+                        return@withContext client.newCall(fallbackRequest).execute().use { r2 ->
+                            val r2Body = r2.body.string()
+                            if (!r2.isSuccessful) {
+                                Log.e(TAG, "OpenAI fallback API Error ${r2.code}: $r2Body")
+                                errorJsonStub(extractApiError(r2.code, r2Body))
+                            } else {
+                                JSONObject(r2Body)
+                                    .getJSONArray("choices")
+                                    .getJSONObject(0)
+                                    .getJSONObject("message")
+                                    .getString("content")
+                            }
+                        }
+                    }
+                    return@withContext errorJsonStub(extractApiError(response.code, responseString))
                 }
 
                 return@withContext JSONObject(responseString)
@@ -561,6 +618,19 @@ Respond with JSON only."""
             e.printStackTrace()
             showToastOnMain(context, "Network Error: ${e.message}")
             return@withContext errorJsonStub("Connection Failed")
+        } catch (e: KimiApiException) {
+            e.printStackTrace()
+            Log.e(TAG, "Kimi API Error ${e.code}: ${e.message}")
+            // e.message already contains the full response body from KimiApiException constructor
+            val kimiDetail = try {
+                val json = JSONObject(e.message?.substringAfter("${e.code}: ") ?: "")
+                json.optJSONObject("error")?.optString("message")
+                    ?: json.optString("error_msg").takeIf { it.isNotEmpty() }
+                    ?: e.message?.take(200) ?: "Unknown error"
+            } catch (_: Exception) {
+                e.message?.take(200) ?: "Unknown error"
+            }
+            return@withContext errorJsonStub("API Error ${e.code}: $kimiDetail")
         } catch (e: Exception) {
             e.printStackTrace()
             val unknownError = "Unexpected error: ${e.message}"
