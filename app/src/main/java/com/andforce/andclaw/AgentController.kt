@@ -348,7 +348,6 @@ object AgentController : ITgBridgeService, IAiConfigService {
         Log.d(TAG, "startAgent: provider=${config.provider}, model=${config.model}, apiUrl=${config.apiUrl}, apiKey=${Utils.maskKey(config.apiKey)}")
 
         agentJob = scope.launch {
-            delay(1500)
             executeAgentStep(input)
         }
     }
@@ -487,8 +486,9 @@ object AgentController : ITgBridgeService, IAiConfigService {
                 } else {
                     addMessage("system", "App opened, checking next step...")
                     isAgentRunning = true
+                    AgentAccessibilityService.instance?.markActionStart()
                     scope.launch {
-                        delay(3000)
+                        AgentAccessibilityService.instance?.waitForUiStable(2500L) ?: delay(2500)
                         executeAgentStep(uiState.userInput)
                     }
                 }
@@ -521,10 +521,10 @@ object AgentController : ITgBridgeService, IAiConfigService {
             }
 
             AiAction.TYPE_WAIT -> {
-                val waitMs = if (action.duration > 0) action.duration.coerceAtMost(10000) else 3000L
-                addMessage("system", "Waiting ${waitMs}ms for UI update...")
+                val waitMs = if (action.duration > 0) action.duration.coerceAtMost(5000) else 1500L
+                addMessage("system", "Waiting for UI update (max ${waitMs}ms)...")
                 scope.launch {
-                    delay(waitMs)
+                    AgentAccessibilityService.instance?.waitForUiStable(waitMs) ?: delay(waitMs)
                     executeAgentStep(uiState.userInput)
                 }
             }
@@ -552,6 +552,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         scope.launch(Dispatchers.IO) {
             var success = false
             var outputMsg: String? = null
+            AgentAccessibilityService.instance?.markActionStart()
             try {
                 when (action.type) {
                     AiAction.TYPE_CLICK -> {
@@ -964,7 +965,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
                     val msg = if (finalMsg != null) "Action success.\n$finalMsg" else "Action success. Waiting for UI refresh..."
                     addMessage("system", msg)
                 }
-                delay(2500)
+                AgentAccessibilityService.instance?.waitForUiStable(2000L) ?: delay(2000)
                 executeAgentStep(uiState.userInput)
             } else {
                 withContext(Dispatchers.Main) {

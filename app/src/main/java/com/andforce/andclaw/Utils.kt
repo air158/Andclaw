@@ -230,9 +230,9 @@ Example POST: {"type":"http_request","data":"https://api.example.com/v1/login","
 
 === WAIT ===
 Wait for a page to finish loading or a UI transition to complete, then re-check the screen.
-Optional "duration" in ms (default 3000, max 10000).
+Optional "duration" in ms (default 1500, max 5000). Keep duration as small as possible.
 Use this when the screen shows loading indicators, spinners, or "努力加载中" style messages.
-Example: {"type":"wait","progress":"商家页面加载中","reason":"页面正在加载，等待完成后继续","duration":3000}
+Example: {"type":"wait","progress":"商家页面加载中","reason":"页面正在加载，等待完成后继续","duration":1500}
 
 === CAMERA ===
 Take photos or record videos using the device camera. Use "camera_action" field:
@@ -448,7 +448,7 @@ CRITICAL: Your entire response must be parseable as JSON. Any non-JSON text will
                 val sw = metrics.widthPixels
                 val sh = metrics.heightPixels
 
-                """Current Screen State:
+                """Current Screen UI (each element: {t:'text',xy:[cx,cy],c:1 if clickable} — xy is center coords for click):
 $screenData
 
 IMPORTANT — SCREENSHOT ATTACHED (Screen resolution: ${sw}x${sh} pixels)
@@ -460,7 +460,7 @@ BROWSER/WEBVIEW NOTE: If the screenshot shows a browser or web page, rely on the
 Respond with JSON only."""
             }
             else
-                "Current Screen State:\n$screenData\n\nPerform the next step. Respond with JSON only."
+                "Current Screen UI (each element: {t:'text',xy:[cx,cy],c:1 if clickable} — xy is center coords for click):\n$screenData\n\nPerform the next step. Respond with JSON only."
 
             if (isKimi) {
                 val kimiMessages = mutableListOf<KimiMessage>()
