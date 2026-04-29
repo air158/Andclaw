@@ -76,6 +76,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
     private var agentJob: Job? = null
     private val recentFingerprints = ArrayDeque<String>()
     private var loopRetryCount = 0
+    private var consecutiveFailCount = 0
     private var uiState = AgentUiState()
 
     private val dpmBridge by lazy { DpmBridge(appContext) }
@@ -342,6 +343,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         uiState = uiState.copy(isRunning = true, userInput = input)
         recentFingerprints.clear()
         loopRetryCount = 0
+        consecutiveFailCount = 0
 
         Log.d(TAG, "startAgent: provider=${config.provider}, model=${config.model}, apiUrl=${config.apiUrl}, apiKey=${Utils.maskKey(config.apiKey)}")
 
@@ -385,6 +387,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
                         content.startsWith("Execution Exception:") ||
                         content.startsWith("Error occurred:") ||
                         content.startsWith("AI Request Failed:") ||
+                        content.startsWith("Action failed") ||
                         content.startsWith("Action success.")
                     if (shouldKeep) {
                         mapOf("role" to "user", "content" to "System feedback: $content")
@@ -550,10 +553,37 @@ object AgentController : ITgBridgeService, IAiConfigService {
             try {
                 when (action.type) {
                     AiAction.TYPE_CLICK -> {
+                        val svc = AgentAccessibilityService.instance
+                        val beforeHash = svc?.captureScreenHierarchy()?.hashCode()
                         withContext(Dispatchers.Main) {
-                            AgentAccessibilityService.instance?.click(action.x, action.y)
+                            svc?.click(action.x, action.y)
                         }
-                        success = true
+                        AgentAccessibilityService.instance?.waitForUiStable(1500L) ?: delay(1500)
+                        val afterHash = svc?.captureScreenHierarchy()?.hashCode()
+                        if (beforeHash != null && beforeHash == afterHash) {
+                            // UI unchanged: capture screenshot so AI can see what is actually on
+                            // screen rather than continuing to click elements it imagined.
+                            val screenshot = captureScreenBase64()
+                            consecutiveFailCount++
+                            val failNote = "Click at (${action.x},${action.y}) had no visible effect " +
+                                "(attempt $consecutiveFailCount/3). Look at the screenshot to see " +
+                                "what is actually on screen and choose a different element or approach."
+                            if (consecutiveFailCount >= 3) {
+                                withContext(Dispatchers.Main) {
+                                    addMessage("system", failNote, screenshotBase64 = screenshot)
+                                    addMessage("system", "Click failed 3 times with no effect. Agent stopped.")
+                                    stopAgent()
+                                }
+                            } else {
+                                withContext(Dispatchers.Main) {
+                                    addMessage("system", failNote, screenshotBase64 = screenshot)
+                                }
+                                executeAgentStep(uiState.userInput, screenshotBase64 = screenshot)
+                            }
+                            return@launch
+                        } else {
+                            success = true
+                        }
                     }
 
                     AiAction.TYPE_SWIPE -> {
@@ -960,16 +990,31 @@ object AgentController : ITgBridgeService, IAiConfigService {
 
             val finalMsg = outputMsg
             if (success && isAgentRunning) {
+                consecutiveFailCount = 0
                 withContext(Dispatchers.Main) {
                     val msg = if (finalMsg != null) "Action success.\n$finalMsg" else "Action success. Waiting for UI refresh..."
                     addMessage("system", msg)
                 }
-                AgentAccessibilityService.instance?.waitForUiStable(2000L) ?: delay(2000)
+                // click already waited inside its handler; other actions still need the settle wait
+                if (action.type != AiAction.TYPE_CLICK) {
+                    AgentAccessibilityService.instance?.waitForUiStable(2000L) ?: delay(2000)
+                }
                 executeAgentStep(uiState.userInput)
+            } else if (!isAgentRunning) {
+                // agent was stopped externally, do nothing
             } else {
-                withContext(Dispatchers.Main) {
-                    if (finalMsg != null) addMessage("system", finalMsg)
-                    stopAgent()
+                consecutiveFailCount++
+                if (consecutiveFailCount >= 3) {
+                    withContext(Dispatchers.Main) {
+                        addMessage("system", "Action failed 3 times in a row. Stopping agent. Last error: $finalMsg")
+                        stopAgent()
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        addMessage("system", "Action failed (attempt $consecutiveFailCount/3): $finalMsg. Retrying with a different approach...")
+                    }
+                    AgentAccessibilityService.instance?.waitForUiStable(1500L) ?: delay(1500)
+                    executeAgentStep(uiState.userInput)
                 }
             }
         }
@@ -977,19 +1022,39 @@ object AgentController : ITgBridgeService, IAiConfigService {
 
     private fun executeIntent(action: AiAction) {
         try {
-            Intent(action.action).let { intent ->
-                if (!action.data.isNullOrEmpty()) {
-                    intent.data = action.data.toUri()
+            val pkg = action.packageName
+            val cls = action.className
+            // When only package is given, prefer getLaunchIntentForPackage which correctly
+            // resolves the LAUNCHER activity (plain setPackage without LAUNCHER category fails).
+            val intent: Intent = if (!pkg.isNullOrEmpty() && cls.isNullOrEmpty()) {
+                val launchIntent = appContext.packageManager.getLaunchIntentForPackage(pkg)
+                if (launchIntent != null) {
+                    if (!action.data.isNullOrEmpty()) launchIntent.data = action.data.toUri()
+                    action.fillIntentExtras(launchIntent)
+                    launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    launchIntent
+                } else {
+                    // Package not installed — report clearly and hint at discovery
+                    addMessage(
+                        "system",
+                        "Intent failed: Package \"$pkg\" not found on this device. " +
+                            "Use dpm action \"getInstalledPackages\" (extras: {\"filter\":\"user\"}) to list installed apps and find the correct package name."
+                    )
+                    return
                 }
-                if (!action.packageName.isNullOrEmpty() && !action.className.isNullOrEmpty()) {
-                    intent.component = ComponentName(action.packageName, action.className)
-                } else if (!action.packageName.isNullOrEmpty()) {
-                    intent.setPackage(action.packageName)
+            } else {
+                Intent(action.action).also { intent ->
+                    if (!action.data.isNullOrEmpty()) intent.data = action.data.toUri()
+                    if (!pkg.isNullOrEmpty() && !cls.isNullOrEmpty()) {
+                        intent.component = ComponentName(pkg, cls)
+                    } else if (!pkg.isNullOrEmpty()) {
+                        intent.setPackage(pkg)
+                    }
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    action.fillIntentExtras(intent)
                 }
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                action.fillIntentExtras(intent)
-                appContext.startActivity(intent)
             }
+            appContext.startActivity(intent)
         } catch (e: Exception) {
             addMessage("system", "Intent failed: ${e.message}")
         }

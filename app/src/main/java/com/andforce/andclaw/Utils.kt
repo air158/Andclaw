@@ -188,6 +188,7 @@ Settings: action:"android.provider.Settings.ACTION_WIFI_SETTINGS"
 Open downloads list: action:"android.intent.action.VIEW_DOWNLOADS"
 Launch specific app: action:"android.intent.action.MAIN", package_name:"com.example", class_name:"com.example.MainActivity"
 Launch by package only: action:"android.intent.action.MAIN", package_name:"com.example"
+IMPORTANT: If the package name is unknown or the intent fails, use dpm "getInstalledPackages" (extras:{"filter":"user"}) to list installed apps and find the correct package name before retrying.
 
 === CLICK ===
 Tap at coordinates from the UI tree. Use x and y fields.
@@ -299,6 +300,8 @@ ${if (isDeviceOwner) "17" else "16"}. If system feedback says an action failed o
 ${if (isDeviceOwner) "18" else "17"}. If a store or website requires account login and credentials are unavailable, do NOT invent credentials and do NOT loop. Choose another install path or return "finish" with the blocking reason.
 ${if (isDeviceOwner) "19" else "18"}. After a file download starts, do NOT just say "wait". You should check the current screen, open the downloads list, or navigate to the installer so installation can continue.
 ${if (isDeviceOwner) "20" else "19"}. Write "progress" and "reason" in the same language as the user's goal.
+${if (isDeviceOwner) "21" else "20"}. WRONG APP / WRONG SCREEN: The screen data starts with "CurrentApp: <package>". If the current app is not the one needed for the task, do NOT keep trying inside it. Use global_action:home to return to the launcher, then find and open the correct app. If you need to find an app's package name, use the launcher's search or dpm getInstalledPackages.
+${if (isDeviceOwner) "22" else "21"}. NAVIGATION STUCK: If you have clicked or acted on the same screen multiple times with no progress, step back: use global_action:back or global_action:home, then approach the goal from a different path.
 
 === OUTPUT FORMAT ===
 You MUST output ONLY a raw JSON object. No text before or after. No markdown fences. Example:

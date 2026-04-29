@@ -42,7 +42,6 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     fun captureScreenHierarchy(): String {
-        val root = rootInActiveWindow ?: return "Empty Screen"
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val metrics = DisplayMetrics()
         @Suppress("DEPRECATION")
@@ -50,8 +49,25 @@ class AgentAccessibilityService : AccessibilityService() {
         val sw = metrics.widthPixels
         val sh = metrics.heightPixels
         val sb = StringBuilder()
+
+        // Use the topmost application window so background fragments/activities
+        // don't pollute the tree with elements the user can't see.
+        val appWindows = windows?.filter {
+            it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_APPLICATION
+        }
+        val topWindow = if (!appWindows.isNullOrEmpty()) {
+            appWindows.maxByOrNull { it.layer }
+        } else null
+        val root = topWindow?.root ?: rootInActiveWindow ?: return "Empty Screen"
+
+        // Prepend current app package so the LLM always knows which app is on screen.
+        val pkg = root.packageName?.toString()
+        if (!pkg.isNullOrEmpty()) sb.append("CurrentApp: $pkg\n")
+
         parseNode(root, sb, sw, sh)
-        return sb.toString()
+        val result = sb.toString()
+        Log.d("AgentTree", "sw=$sw sh=$sh\n$result")
+        return result
     }
 
     private fun parseNode(node: AccessibilityNodeInfo?, sb: StringBuilder, sw: Int = 9999, sh: Int = 9999) {
@@ -59,12 +75,14 @@ class AgentAccessibilityService : AccessibilityService() {
         val text = node.text?.toString()
         val desc = node.contentDescription?.toString()
         val label = if (!text.isNullOrEmpty()) text else desc
-        if (node.isClickable || !label.isNullOrEmpty()) {
+        if ((node.isClickable || !label.isNullOrEmpty()) && node.isVisibleToUser && node.isEnabled) {
             val rect = Rect()
             node.getBoundsInScreen(rect)
-            if (rect.right > 0 && rect.bottom > 0 && rect.left < sw && rect.top < sh) {
-                val cx = (rect.left + rect.right) / 2
-                val cy = (rect.top + rect.bottom) / 2
+            val cx = (rect.left + rect.right) / 2
+            val cy = (rect.top + rect.bottom) / 2
+            // Center point must be strictly within screen; bounding-box overlap is not enough.
+            // This filters elements whose center is off-screen (e.g. adjacent ViewPager pages).
+            if (rect.width() > 0 && rect.height() > 0 && cx in 0 until sw && cy in 0 until sh) {
                 sb.append("{")
                 if (!label.isNullOrEmpty()) sb.append("t:'${label.replace("'", "\\'")}',")
                 sb.append("xy:[$cx,$cy]")
