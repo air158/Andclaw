@@ -180,9 +180,25 @@ class AgentAccessibilityService : AccessibilityService() {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
 
+        fun pasteViaClipboard(node: AccessibilityNodeInfo): Boolean {
+            val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("input", text))
+            return node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        }
+
+        // ACTION_SET_TEXT may return true at the framework level but the app may silently ignore it
+        // (common in custom TextViews, Bilibili comments, etc.). Always verify by refreshing the node.
+        fun setTextVerified(node: AccessibilityNodeInfo): Boolean {
+            if (!node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return false
+            node.refresh()
+            val written = node.text?.toString() ?: ""
+            return written.isNotEmpty()
+        }
+
         val focusedNode = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
         if (focusedNode != null) {
-            if (focusedNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+            if (setTextVerified(focusedNode)) return true
+            if (pasteViaClipboard(focusedNode)) return true
         }
 
         val root = rootInActiveWindow
@@ -190,20 +206,29 @@ class AgentAccessibilityService : AccessibilityService() {
             val editableNode = findEditableNode(root)
             if (editableNode != null) {
                 if (!editableNode.isFocused) editableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                if (editableNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
-                val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-                clipboard.setPrimaryClip(ClipData.newPlainText("input", text))
-                if (editableNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)) return true
+                if (setTextVerified(editableNode)) return true
+                if (pasteViaClipboard(editableNode)) return true
             }
         }
 
         val anyFocused = focusedNode ?: findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY)
         if (anyFocused != null) {
-            val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("input", text))
-            if (anyFocused.performAction(AccessibilityNodeInfo.ACTION_PASTE)) return true
+            if (pasteViaClipboard(anyFocused)) return true
         }
         return false
+    }
+
+    fun getEditableText(): String? {
+        val focused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused != null) {
+            focused.refresh()
+            val t = focused.text?.toString()
+            if (!t.isNullOrEmpty()) return t
+        }
+        val root = rootInActiveWindow ?: return null
+        val editable = findEditableNode(root) ?: return null
+        editable.refresh()
+        return editable.text?.toString()
     }
 
     private fun findEditableNode(node: AccessibilityNodeInfo, depth: Int = 0): AccessibilityNodeInfo? {

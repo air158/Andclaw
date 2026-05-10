@@ -76,6 +76,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
     private var agentJob: Job? = null
     private val recentFingerprints = ArrayDeque<String>()
     private val recentScreenHashes = ArrayDeque<Int>()
+    private val bannedFingerprints = mutableSetOf<String>()
     private var loopRetryCount = 0
     private var consecutiveFailCount = 0
     private var uiState = AgentUiState()
@@ -344,6 +345,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         uiState = uiState.copy(isRunning = true, userInput = input)
         recentFingerprints.clear()
         recentScreenHashes.clear()
+        bannedFingerprints.clear()
         loopRetryCount = 0
         consecutiveFailCount = 0
 
@@ -397,11 +399,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
 
         if (screenLoopWarning != null) {
             addMessage("system", "[界面重复] $screenLoopWarning")
-            if (loopRetryCount > 3) {
-                addMessage("system", "Agent stopped: repeatedly returning to the same screen after warnings.")
-                stopAgent()
-                return
-            }
+            // Always retry with a new path instead of stopping
         }
 
         var finalScreenshot = screenshotBase64
@@ -487,36 +485,44 @@ object AgentController : ITgBridgeService, IAiConfigService {
             AiAction.TYPE_HTTP_REQUEST -> "${action.type}_${action.data}_${action.httpMethod}"
             else -> "${action.type}_${action.x}_${action.y}"
         }
+        // Check banned fingerprints before adding to history
+        if (fingerprint in bannedFingerprints) {
+            val actionDesc = describeRepeatedAction(action)
+            val bannedList = bannedFingerprints.joinToString("；")
+            scope.launch {
+                val screenshot = captureScreenBase64()
+                val warning = "你尝试执行的动作【$actionDesc】已被列入禁止列表，因为你之前重复执行过它导致循环。" +
+                    "当前所有禁止动作：$bannedList。请根据截图选择一个全新的、从未执行过的动作来推进任务。"
+                addMessage("system", "[禁止动作拦截] $warning", screenshotBase64 = screenshot)
+                executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = warning)
+            }
+            return
+        }
+
         recentFingerprints.addLast(fingerprint)
         if (recentFingerprints.size > 12) recentFingerprints.removeFirst()
 
         val loopDescription = detectLoop(recentFingerprints, fingerprint)
         if (loopDescription != null) {
-            recentFingerprints.clear()
+            // Add all fingerprints involved in the loop to the banned set
+            recentFingerprints.toSet().forEach { bannedFingerprints.add(it) }
 
+            loopRetryCount++
             val actionDesc = describeRepeatedAction(action)
-            when (loopRetryCount) {
-                0 -> {
-                    loopRetryCount++
-                    val warning = "你陷入了循环（$loopDescription）。最近一次的动作是：$actionDesc。" +
-                        "这些动作的组合没有推进任务进展，请停止当前路径，重新分析界面并尝试完全不同的方法。"
-                    addMessage("system", "[循环检测] $warning")
-                    scope.launch { executeAgentStep(uiState.userInput, loopWarning = warning) }
+            val bannedList = bannedFingerprints.joinToString("；")
+            val isFirstLoop = loopRetryCount == 1
+            scope.launch {
+                val screenshot = if (!isFirstLoop) captureScreenBase64() else null
+                val warning = if (isFirstLoop) {
+                    "你陷入了循环（$loopDescription），检测到的重复动作已被加入禁止列表：$bannedList。" +
+                        "请停止当前路径，重新分析界面并尝试完全不同的方法，禁止执行上述任何动作。"
+                } else {
+                    "你在收到循环警告后依然陷入了循环（$loopDescription），当前禁止动作列表：$bannedList。" +
+                        "请根据截图彻底换一条路径，这些动作已永久禁止，不得再次执行。"
                 }
-                1 -> {
-                    loopRetryCount++
-                    scope.launch {
-                        val screenshot = captureScreenBase64()
-                        val warning = "你在收到循环警告后依然陷入了循环（$loopDescription），最近动作：$actionDesc。" +
-                            "请根据截图重新观察当前界面，彻底换一条路径来完成任务。"
-                        addMessage("system", "[循环检测-第二次] $warning", screenshotBase64 = screenshot)
-                        executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = warning)
-                    }
-                }
-                else -> {
-                    addMessage("system", "Loop detected. Still looping ($loopDescription) after warnings. Agent stopped.")
-                    stopAgent()
-                }
+                val tag = if (isFirstLoop) "[循环检测]" else "[循环检测-第${loopRetryCount}次]"
+                addMessage("system", "$tag $warning", screenshotBase64 = screenshot)
+                executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = warning)
             }
             return
         }
@@ -588,8 +594,9 @@ object AgentController : ITgBridgeService, IAiConfigService {
             }
 
             else -> {
-                addMessage("system", "Unknown action: ${action.type}")
-                stopAgent()
+                val warning = "你返回了未知动作类型：${action.type}。请只使用支持的动作类型，重新分析界面并选择正确的动作。"
+                addMessage("system", "[未知动作] $warning")
+                scope.launch { executeAgentStep(uiState.userInput, loopWarning = warning) }
             }
         }
     }
@@ -618,11 +625,12 @@ object AgentController : ITgBridgeService, IAiConfigService {
                             val hasScreenshot = screenshot != null
                             Log.d(TAG, "click no effect #$consecutiveFailCount, screenshot=${if (hasScreenshot) "ok" else "null"}")
                             if (consecutiveFailCount >= 4) {
-                                // Agent kept repeating even after an explicit loopWarning: stop.
+                                val loopWarning = "你已经连续${consecutiveFailCount}次点击无效（$actionDesc）。" +
+                                    "彻底放弃点击该位置，必须换一种完全不同的方式来完成任务，例如滚动、返回、使用其他入口等。"
                                 withContext(Dispatchers.Main) {
-                                    addMessage("system", "点击无效超过4次，已停止。重复的动作：$actionDesc")
-                                    stopAgent()
+                                    addMessage("system", "[点击无效-强制换路] $loopWarning", screenshotBase64 = screenshot)
                                 }
+                                executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = loopWarning)
                             } else if (consecutiveFailCount >= 3) {
                                 // Third failure: embed a strong loopWarning in the UI tree context.
                                 val loopWarning = "你已经连续3次执行了同一个无效动作：$actionDesc。" +
@@ -686,12 +694,16 @@ object AgentController : ITgBridgeService, IAiConfigService {
                             val result = withContext(Dispatchers.Main) {
                                 svc.inputText(action.text)
                             }
-                            if (result) {
-                                success = true
-                            } else {
-                                // Feed failure back to AI rather than stopping, so it can try another approach
-                                success = true
-                                outputMsg = "text_input failed: no editable field found or focus failed. Try clicking the input field first or use a different approach."
+                            success = true
+                            // Read the field's actual content to verify the text was really written.
+                            // ACTION_SET_TEXT can return true at the framework level while the app
+                            // silently ignores it (e.g. Bilibili comment box, WebView inputs).
+                            val actualText = withContext(Dispatchers.Main) { svc.getEditableText() }
+                            val textVerified = !actualText.isNullOrBlank()
+                            outputMsg = when {
+                                textVerified -> "text_input success. Input field now contains: \"$actualText\""
+                                result -> "text_input API reported success but the input field appears empty or unreadable (app may use custom input handling). Current field content: \"${actualText ?: "unreadable"}\". Try: 1) click the field first then retry, 2) check if a different input method is needed."
+                                else -> "text_input failed: no editable field found or focus failed. Try clicking the input field first or use a different approach."
                             }
                         }
                     }
