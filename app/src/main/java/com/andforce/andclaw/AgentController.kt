@@ -75,6 +75,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         private set
     private var agentJob: Job? = null
     private val recentFingerprints = ArrayDeque<String>()
+    private val recentScreenHashes = ArrayDeque<Int>()
     private var loopRetryCount = 0
     private var consecutiveFailCount = 0
     private var uiState = AgentUiState()
@@ -342,6 +343,7 @@ object AgentController : ITgBridgeService, IAiConfigService {
         isAgentRunning = true
         uiState = uiState.copy(isRunning = true, userInput = input)
         recentFingerprints.clear()
+        recentScreenHashes.clear()
         loopRetryCount = 0
         consecutiveFailCount = 0
 
@@ -371,10 +373,35 @@ object AgentController : ITgBridgeService, IAiConfigService {
 
         val svc = AgentAccessibilityService.instance
         val baseScreenData = svc?.captureScreenHierarchy() ?: "Screen data inaccessible"
-        val screenData = if (loopWarning != null) {
-            "$baseScreenData\n\n[系统警告] $loopWarning"
+
+        // Track UI state hashes to detect "agent keeps returning to the same screen"
+        // regardless of which actions it used to get there.
+        val screenHash = baseScreenData.hashCode()
+        recentScreenHashes.addLast(screenHash)
+        if (recentScreenHashes.size > 10) recentScreenHashes.removeFirst()
+        val screenRepeatCount = recentScreenHashes.count { it == screenHash }
+        val screenLoopWarning = if (screenRepeatCount >= 3) {
+            loopRetryCount++
+            "你已经第${screenRepeatCount}次回到了完全相同的界面（界面状态没有变化），" +
+                "说明你之前的操作没有产生持续效果，一直在原地打转。" +
+                "请彻底放弃当前路径，用完全不同的思路完成任务。"
+        } else null
+
+        val effectiveWarning = listOfNotNull(loopWarning, screenLoopWarning)
+            .joinToString("\n").ifEmpty { null }
+        val screenData = if (effectiveWarning != null) {
+            "$baseScreenData\n\n[系统警告] $effectiveWarning"
         } else {
             baseScreenData
+        }
+
+        if (screenLoopWarning != null) {
+            addMessage("system", "[界面重复] $screenLoopWarning")
+            if (loopRetryCount > 3) {
+                addMessage("system", "Agent stopped: repeatedly returning to the same screen after warnings.")
+                stopAgent()
+                return
+            }
         }
 
         var finalScreenshot = screenshotBase64
@@ -397,7 +424,11 @@ object AgentController : ITgBridgeService, IAiConfigService {
                         content.startsWith("Error occurred:") ||
                         content.startsWith("AI Request Failed:") ||
                         content.startsWith("Action failed") ||
-                        content.startsWith("Action success.")
+                        content.startsWith("Action success.") ||
+                        content.startsWith("点击") ||
+                        content.startsWith("[点击无效") ||
+                        content.startsWith("[循环检测") ||
+                        content.startsWith("[界面重复")
                     if (shouldKeep) {
                         mapOf("role" to "user", "content" to "System feedback: $content")
                     } else {
@@ -459,35 +490,31 @@ object AgentController : ITgBridgeService, IAiConfigService {
         recentFingerprints.addLast(fingerprint)
         if (recentFingerprints.size > 12) recentFingerprints.removeFirst()
 
-        // Catch both consecutive loops (A A A A) and alternating loops (A B A B A B A B)
-        if (recentFingerprints.count { it == fingerprint } >= 4) {
+        val loopDescription = detectLoop(recentFingerprints, fingerprint)
+        if (loopDescription != null) {
             recentFingerprints.clear()
 
             val actionDesc = describeRepeatedAction(action)
             when (loopRetryCount) {
                 0 -> {
-                    // First time: embed warning directly into the UI tree context so the agent
-                    // sees it alongside the current screen state — not as a past history message.
                     loopRetryCount++
-                    val warning = "你刚才重复执行了同一个动作多次：$actionDesc。" +
-                        "这个动作不能再继续执行。请重新分析当前界面，尝试完全不同的方法或路径来完成任务。"
+                    val warning = "你陷入了循环（$loopDescription）。最近一次的动作是：$actionDesc。" +
+                        "这些动作的组合没有推进任务进展，请停止当前路径，重新分析界面并尝试完全不同的方法。"
                     addMessage("system", "[循环检测] $warning")
                     scope.launch { executeAgentStep(uiState.userInput, loopWarning = warning) }
                 }
                 1 -> {
-                    // Agent still repeating after the inline warning: escalate with screenshot.
                     loopRetryCount++
                     scope.launch {
                         val screenshot = captureScreenBase64()
-                        val warning = "你在收到警告后仍然重复执行了：$actionDesc。" +
-                            "这个方法明确行不通，请根据以下截图重新观察界面，选择一条完全不同的操作路径。"
+                        val warning = "你在收到循环警告后依然陷入了循环（$loopDescription），最近动作：$actionDesc。" +
+                            "请根据截图重新观察当前界面，彻底换一条路径来完成任务。"
                         addMessage("system", "[循环检测-第二次] $warning", screenshotBase64 = screenshot)
                         executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = warning)
                     }
                 }
                 else -> {
-                    // Agent persists after screenshot warning: stop.
-                    addMessage("system", "Loop detected. \"$actionDesc\" repeated too many times even after warnings. Agent stopped.")
+                    addMessage("system", "Loop detected. Still looping ($loopDescription) after warnings. Agent stopped.")
                     stopAgent()
                 }
             }
@@ -584,11 +611,12 @@ object AgentController : ITgBridgeService, IAiConfigService {
                         AgentAccessibilityService.instance?.waitForUiSettle(1500L) ?: delay(1500)
                         val afterHash = svc?.captureScreenHierarchy()?.hashCode()
                         if (beforeHash != null && beforeHash == afterHash) {
-                            // UI unchanged: capture screenshot so AI can see what is actually on
-                            // screen rather than continuing to click elements it imagined.
+                            // UI unchanged: always try to capture screenshot; fall back gracefully.
                             val screenshot = captureScreenBase64()
                             consecutiveFailCount++
                             val actionDesc = describeRepeatedAction(action)
+                            val hasScreenshot = screenshot != null
+                            Log.d(TAG, "click no effect #$consecutiveFailCount, screenshot=${if (hasScreenshot) "ok" else "null"}")
                             if (consecutiveFailCount >= 4) {
                                 // Agent kept repeating even after an explicit loopWarning: stop.
                                 withContext(Dispatchers.Main) {
@@ -596,22 +624,25 @@ object AgentController : ITgBridgeService, IAiConfigService {
                                     stopAgent()
                                 }
                             } else if (consecutiveFailCount >= 3) {
-                                // Third failure: embed a strong loopWarning in the UI tree context
-                                // so the agent sees exactly what it was repeating alongside the screen.
+                                // Third failure: embed a strong loopWarning in the UI tree context.
                                 val loopWarning = "你已经连续3次执行了同一个无效动作：$actionDesc。" +
-                                    "这个位置点击没有任何效果，请根据截图重新观察界面，" +
+                                    "这个位置点击没有任何效果，" +
+                                    (if (hasScreenshot) "请根据截图重新观察界面，" else "请重新分析当前UI界面，") +
                                     "找到正确的元素或换一种完全不同的方式来完成任务。"
                                 withContext(Dispatchers.Main) {
                                     addMessage("system", "[点击无效-第3次] $loopWarning", screenshotBase64 = screenshot)
                                 }
                                 executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = loopWarning)
                             } else {
-                                val failNote = "点击 (${action.x},${action.y}) 没有可见效果（第${consecutiveFailCount}次）。" +
-                                    "你刚才的动作：$actionDesc。请查看截图，选择不同的元素或方法。"
+                                val loopWarning = "你刚才执行的动作没有任何效果（第${consecutiveFailCount}次）：$actionDesc。" +
+                                    "禁止再次点击坐标 (${action.x}, ${action.y})。" +
+                                    if (hasScreenshot) "请根据截图重新观察界面，找到正确的元素位置。"
+                                    else "请根据UI树重新分析界面，找到正确的元素或换一种方法。"
+                                val failNote = "点击 (${action.x},${action.y}) 没有可见效果（第${consecutiveFailCount}次）。$actionDesc"
                                 withContext(Dispatchers.Main) {
                                     addMessage("system", failNote, screenshotBase64 = screenshot)
                                 }
-                                executeAgentStep(uiState.userInput, screenshotBase64 = screenshot)
+                                executeAgentStep(uiState.userInput, screenshotBase64 = screenshot, loopWarning = loopWarning)
                             }
                             return@launch
                         } else {
@@ -1095,6 +1126,56 @@ object AgentController : ITgBridgeService, IAiConfigService {
 
     // --- Helpers ---
 
+    /**
+     * Returns a human-readable loop description if a loop is detected, null otherwise.
+     * Detects:
+     *  - Single action repeated 4+ times: A A A A
+     *  - Period-2 cycle repeated 3+ times: A B A B A B
+     *  - Period-3 cycle repeated 2+ times: A B C A B C
+     *  - Low-diversity: ≤3 distinct actions in last 10 steps (agent spinning in place)
+     */
+    private fun detectLoop(fingerprints: ArrayDeque<String>, current: String): String? {
+        val list = fingerprints.toList()
+        val n = list.size
+
+        // Single action repeated 4+ times in window
+        if (list.count { it == current } >= 4) {
+            return "同一动作重复${list.count { it == current }}次"
+        }
+
+        // Period-2: last 6 entries follow A B A B A B pattern
+        if (n >= 6) {
+            val tail = list.takeLast(6)
+            if (tail[0] == tail[2] && tail[2] == tail[4] &&
+                tail[1] == tail[3] && tail[3] == tail[5] &&
+                tail[0] != tail[1]
+            ) {
+                return "两动作交替循环：${tail[0]} ↔ ${tail[1]}"
+            }
+        }
+
+        // Period-3: last 6 entries follow A B C A B C pattern
+        if (n >= 6) {
+            val tail = list.takeLast(6)
+            if (tail[0] == tail[3] && tail[1] == tail[4] && tail[2] == tail[5] &&
+                setOf(tail[0], tail[1], tail[2]).size == 3
+            ) {
+                return "三动作循环：${tail[0]} → ${tail[1]} → ${tail[2]}"
+            }
+        }
+
+        // Low-diversity: ≤3 distinct actions across last 10 steps
+        if (n >= 10) {
+            val tail = list.takeLast(10)
+            val distinct = tail.toSet()
+            if (distinct.size <= 3) {
+                return "最近10步只有${distinct.size}种不同动作，没有实质进展"
+            }
+        }
+
+        return null
+    }
+
     private fun describeRepeatedAction(action: AiAction): String {
         val detail = when (action.type) {
             AiAction.TYPE_CLICK -> "点击坐标 (${action.x}, ${action.y})"
@@ -1119,16 +1200,20 @@ object AgentController : ITgBridgeService, IAiConfigService {
 
     private suspend fun captureScreenBase64(): String? {
         val svc = AgentAccessibilityService.instance ?: return null
-        return suspendCancellableCoroutine { cont ->
-            svc.captureScreenshot { bitmap ->
-                if (bitmap != null) {
-                    val scaled = scaleBitmapToMaxWidth(bitmap, 720)
-                    val baos = ByteArrayOutputStream()
-                    scaled.compress(Bitmap.CompressFormat.JPEG, 60, baos)
-                    if (scaled !== bitmap) scaled.recycle()
-                    cont.resume(Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP))
-                } else {
-                    cont.resume(null)
+        // takeScreenshot() must be called from the main thread; withContext ensures this
+        // even when captureScreenBase64 is invoked from an IO-dispatcher coroutine.
+        return withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine { cont ->
+                svc.captureScreenshot { bitmap ->
+                    if (bitmap != null) {
+                        val scaled = scaleBitmapToMaxWidth(bitmap, 720)
+                        val baos = ByteArrayOutputStream()
+                        scaled.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+                        if (scaled !== bitmap) scaled.recycle()
+                        cont.resume(Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP))
+                    } else {
+                        cont.resume(null)
+                    }
                 }
             }
         }
@@ -1159,10 +1244,11 @@ object AgentController : ITgBridgeService, IAiConfigService {
             }
         }
 
-        if (RemoteOutboundHelper.shouldAttemptRemoteEcho(role, activeRemoteSession)) {
+        val sessionSnapshot = activeRemoteSession
+        if (RemoteOutboundHelper.shouldAttemptRemoteEcho(role, sessionSnapshot)) {
             scope.launch(Dispatchers.IO) {
                 RemoteOutboundHelper.sendText(
-                    remoteBridge, activeRemoteSession, "[$role] $content"
+                    remoteBridge, sessionSnapshot, "[$role] $content"
                 )
             }
         }
